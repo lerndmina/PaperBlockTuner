@@ -10,7 +10,6 @@ import io.github.lumine1909.blocktuner.metrics.Metrics;
 import io.github.lumine1909.blocktuner.network.BlockTunerProtocol;
 import io.github.lumine1909.blocktuner.util.Message;
 import io.github.lumine1909.blocktuner.util.StorageUtil;
-import io.github.lumine1909.messageutil.api.MessageUtil;
 import io.papermc.paper.threadedregions.scheduler.ScheduledTask;
 import org.bukkit.Bukkit;
 import org.bukkit.entity.Player;
@@ -26,17 +25,22 @@ public class BlockTunerPlugin extends JavaPlugin {
     public static ScheduledTask displayTask;
     public static String DATABASE_PATH;
 
+    private BlockTunerProtocol protocol;
+
     @Override
     public void onEnable() {
         plugin = this;
         DATABASE_PATH = new File(getDataFolder(), "playerdata.db").getAbsolutePath();
-        MessageUtil.register(this, BlockTunerProtocol.class);
+        protocol = new BlockTunerProtocol();
+        Bukkit.getMessenger().registerIncomingPluginChannel(this, BlockTunerProtocol.SERVER_BOUND_HELLO, protocol);
+        Bukkit.getMessenger().registerIncomingPluginChannel(this, BlockTunerProtocol.SERVER_BOUND_TUNING, protocol);
+        Bukkit.getMessenger().registerOutgoingPluginChannel(this, BlockTunerProtocol.CLIENT_BOUND_HELLO);
         callReload();
         StorageUtil.initDatabase();
         registerEvents();
         registerCommands();
         for (Player player : Bukkit.getOnlinePlayers()) {
-            MessageUtil.injectDirect(player);
+            protocol.injectPlayer(player);
             PlayerData.of(player);
         }
         displayTask = Bukkit.getGlobalRegionScheduler().runAtFixedRate(this, (task) -> new InfoDisplayTask().run(), 1, 2);
@@ -47,6 +51,9 @@ public class BlockTunerPlugin extends JavaPlugin {
     public void onDisable() {
         for (Player player : Bukkit.getOnlinePlayers()) {
             StorageUtil.save(PlayerData.of(player));
+            if (protocol != null) {
+                protocol.uninjectPlayer(player);
+            }
         }
         if (displayTask != null) {
             displayTask.cancel();
@@ -63,7 +70,7 @@ public class BlockTunerPlugin extends JavaPlugin {
     private void registerEvents() {
         new NotePlayListener();
         new DisplayTaskListener();
-        new DataHandleListener();
+        new DataHandleListener(protocol);
         new StickInteractListener();
         new ScrollTuningListener();
         new GuiListener();

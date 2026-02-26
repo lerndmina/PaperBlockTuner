@@ -17,7 +17,6 @@ repositories {
 
 dependencies {
     paperweight.paperDevBundle("1.21.11-R0.1-SNAPSHOT")
-    implementation("io.github.lumine1909:messageutil:1.1.1")
     compileOnly("com.intellectualsites.plotsquared:plotsquared-core:7.5.11")
     compileOnly("com.fastasyncworldedit:FastAsyncWorldEdit-Core:2.14.2")
     compileOnly("org.xerial:sqlite-jdbc:3.49.1.0")

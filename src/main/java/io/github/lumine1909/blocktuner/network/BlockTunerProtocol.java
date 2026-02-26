@@ -5,11 +5,11 @@ import io.github.lumine1909.blocktuner.object.Instrument;
 import io.github.lumine1909.blocktuner.util.InstrumentUtil;
 import io.github.lumine1909.blocktuner.util.NoteUtil;
 import io.github.lumine1909.blocktuner.util.TuneUtil;
-import io.github.lumine1909.messageutil.api.MessageReceiver;
-import io.github.lumine1909.messageutil.object.PacketContext;
-import io.github.lumine1909.messageutil.object.PacketEvent;
+import io.netty.buffer.Unpooled;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelHandlerContext;
 import net.minecraft.core.BlockPos;
-import net.minecraft.nbt.CompoundTag;
 import net.minecraft.network.FriendlyByteBuf;
 import net.minecraft.network.protocol.game.ClientboundSetHeldSlotPacket;
 import net.minecraft.network.protocol.game.ServerboundPickItemFromBlockPacket;
@@ -27,18 +27,22 @@ import net.minecraft.world.level.block.state.BlockState;
 import net.minecraft.world.level.block.state.properties.NoteBlockInstrument;
 import net.minecraft.world.level.storage.TagValueOutput;
 import org.bukkit.Bukkit;
+import org.bukkit.craftbukkit.entity.CraftPlayer;
 import org.bukkit.craftbukkit.inventory.CraftItemStack;
+import org.bukkit.entity.Player;
+import org.bukkit.plugin.messaging.PluginMessageListener;
 
 import static io.github.lumine1909.blocktuner.BlockTunerPlugin.plugin;
 import static io.github.lumine1909.blocktuner.util.ReflectionUtil.set;
 
-public class BlockTunerProtocol extends MessageReceiver {
+public class BlockTunerProtocol implements PluginMessageListener {
 
     public static final String MOD_ID = "blocktuner";
     public static final String CLIENT_BOUND_HELLO = "blocktuner:client_bound_hello";
     public static final String SERVER_BOUND_HELLO = "blocktuner:server_bound_hello";
     public static final String SERVER_BOUND_TUNING = "blocktuner:server_bound_tuning";
     private static final int TUNING_PROTOCOL = 3;
+    private static final String HANDLER_NAME = "blocktuner_pick_handler";
 
     @SuppressWarnings("deprecation")
     private static void addBlockDataToItem(BlockState state, ServerLevel level, BlockPos pos, ItemStack stack) {
@@ -73,66 +77,88 @@ public class BlockTunerProtocol extends MessageReceiver {
     }
 
     @Override
-    public boolean isActive() {
-        return plugin.isEnabled();
-    }
-
-    @MessageReceiver.Bytebuf(key = SERVER_BOUND_HELLO)
-    public void handleHello(PacketContext context, PacketEvent event, FriendlyByteBuf buf) {
-        int protocolVersion = buf.readInt();
-        if (protocolVersion == TUNING_PROTOCOL) {
-            event.setCancelled(true);
-            context.send(CLIENT_BOUND_HELLO, buf);
+    public void onPluginMessageReceived(String channel, Player player, byte[] message) {
+        FriendlyByteBuf buf = new FriendlyByteBuf(Unpooled.wrappedBuffer(message));
+        ServerPlayer serverPlayer = ((CraftPlayer) player).getHandle();
+        if (channel.equals(SERVER_BOUND_HELLO)) {
+            int protocolVersion = buf.readInt();
+            if (protocolVersion == TUNING_PROTOCOL) {
+                player.sendPluginMessage(plugin, CLIENT_BOUND_HELLO, message);
+            }
+        } else if (channel.equals(SERVER_BOUND_TUNING)) {
+            BlockPos pos = buf.readBlockPos();
+            int note = buf.readInt();
+            Level world = serverPlayer.level();
+            if (world.getBlockState(pos).getBlock() == Blocks.NOTE_BLOCK) {
+                Bukkit.getScheduler().runTask(plugin, () -> TuneUtil.tune(serverPlayer, (ServerLevel) world, pos, NoteUtil.byNote(note), Instrument.DEFAULT));
+            }
         }
     }
 
-    @MessageReceiver.Bytebuf(key = SERVER_BOUND_TUNING)
-    public void handleTuning(PacketContext context, PacketEvent event, FriendlyByteBuf buf) {
-        event.setCancelled(true);
-        ServerPlayer player = context.player();
-        BlockPos pos = buf.readBlockPos();
-        int note = buf.readInt();
-        Level world = player.level();
-        if (world.getBlockState(pos).getBlock() == Blocks.NOTE_BLOCK) {
-            Bukkit.getScheduler().runTask(plugin, () -> TuneUtil.tune(player, (ServerLevel) world, pos, NoteUtil.byNote(note), Instrument.DEFAULT));
+    public void injectPlayer(Player player) {
+        try {
+            Channel channel = ((CraftPlayer) player).getHandle().connection.connection.channel;
+            if (channel.pipeline().get(HANDLER_NAME) == null) {
+                channel.pipeline().addBefore("packet_handler", HANDLER_NAME, new PickItemHandler(((CraftPlayer) player).getHandle()));
+            }
+        } catch (Exception ignored) {
         }
     }
 
-    @MessageReceiver.Vanilla(packetType = ServerboundPickItemFromBlockPacket.class)
-    public void handlePickItem(PacketContext context, PacketEvent event, ServerboundPickItemFromBlockPacket packet) {
-        if (!packet.includeData()) {
-            return;
+    public void uninjectPlayer(Player player) {
+        try {
+            Channel channel = ((CraftPlayer) player).getHandle().connection.connection.channel;
+            if (channel.pipeline().get(HANDLER_NAME) != null) {
+                channel.pipeline().remove(HANDLER_NAME);
+            }
+        } catch (Exception ignored) {
         }
-        ServerPlayer player = context.player();
-        ServerLevel serverLevel = player.level();
-        BlockPos blockPos = packet.pos();
-        if (!player.isWithinBlockInteractionRange(blockPos, 1.0F) || !serverLevel.isLoaded(blockPos)) {
-            return;
+    }
+
+    private class PickItemHandler extends ChannelDuplexHandler {
+
+        private final ServerPlayer serverPlayer;
+
+        PickItemHandler(ServerPlayer serverPlayer) {
+            this.serverPlayer = serverPlayer;
         }
-        BlockState blockState = serverLevel.getBlockState(blockPos);
-        if (!(blockState.getBlock() instanceof NoteBlock)) {
-            return;
+
+        @Override
+        public void channelRead(ChannelHandlerContext ctx, Object msg) throws Exception {
+            if (msg instanceof ServerboundPickItemFromBlockPacket packet && packet.includeData()) {
+                ServerLevel serverLevel = serverPlayer.level();
+                BlockPos blockPos = packet.pos();
+                if (!serverPlayer.isRemoved() && serverPlayer.isWithinBlockInteractionRange(blockPos, 1.0F) && serverLevel.isLoaded(blockPos)) {
+                    BlockState blockState = serverLevel.getBlockState(blockPos);
+                    if (blockState.getBlock() instanceof NoteBlock) {
+                        boolean flag = serverPlayer.hasInfiniteMaterials();
+                        ItemStack cloneItemStack = blockState.getCloneItemStack(serverLevel, blockPos, flag);
+                        if (!cloneItemStack.isEmpty()) {
+                            if (flag && serverPlayer.getBukkitEntity().hasPermission("minecraft.nbt.copy")) {
+                                addBlockDataToItem(blockState, serverLevel, blockPos, cloneItemStack);
+                            }
+                            final ItemStack toPick;
+                            if (flag) {
+                                org.bukkit.inventory.ItemStack bukkitItemStack = CraftItemStack.asBukkitCopy(cloneItemStack);
+                                NoteBlockInstrument instrument = blockState.getValue(NoteBlock.INSTRUMENT);
+                                Integer note = blockState.getValue(NoteBlock.NOTE);
+                                NoteBlockData data = new NoteBlockData(note, InstrumentUtil.byMcName(instrument.name().toLowerCase()));
+                                bukkitItemStack = data.apply(bukkitItemStack);
+                                toPick = CraftItemStack.asNMSCopy(bukkitItemStack);
+                            } else {
+                                toPick = cloneItemStack;
+                            }
+                            Bukkit.getScheduler().runTask(plugin, () -> {
+                                if (!serverPlayer.isRemoved()) {
+                                    tryPickItem(toPick, serverPlayer);
+                                }
+                            });
+                        }
+                        return;
+                    }
+                }
+            }
+            super.channelRead(ctx, msg);
         }
-        boolean flag = player.hasInfiniteMaterials();
-        ItemStack cloneItemStack = blockState.getCloneItemStack(serverLevel, blockPos, flag);
-        event.setCancelled(true);
-        if (cloneItemStack.isEmpty()) {
-            return;
-        }
-        if (flag && player.getBukkitEntity().hasPermission("minecraft.nbt.copy")) {
-            addBlockDataToItem(blockState, serverLevel, blockPos, cloneItemStack);
-        }
-        final ItemStack toPick;
-        if (flag) {
-            org.bukkit.inventory.ItemStack bukkitItemStack = CraftItemStack.asBukkitCopy(cloneItemStack);
-            NoteBlockInstrument instrument = blockState.getValue(NoteBlock.INSTRUMENT);
-            Integer note = blockState.getValue(NoteBlock.NOTE);
-            NoteBlockData data = new NoteBlockData(note, InstrumentUtil.byMcName(instrument.name().toLowerCase()));
-            bukkitItemStack = data.apply(bukkitItemStack);
-            toPick = CraftItemStack.asNMSCopy(bukkitItemStack);
-        } else {
-            toPick = cloneItemStack;
-        }
-        Bukkit.getScheduler().runTask(plugin, () -> tryPickItem(toPick, player));
     }
 }
